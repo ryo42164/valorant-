@@ -1,0 +1,13 @@
+data/
+outputs/
+*.mp4
+*.avi
+*.mov
+*.pt
+*.pth
+*.ckpt
+__pycache__/
+.ipynb_checkpoints/
+.env
+venv/
+.venv/
