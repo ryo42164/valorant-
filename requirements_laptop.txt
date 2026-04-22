@@ -1,0 +1,16 @@
+numpy
+pandas
+matplotlib
+opencv-python
+pillow
+jupyter
+ipykernel
+PyYAML
+requests
+scikit-image
+scipy
+yt-dlp
+torch
+torchvision
+torchaudio
+easyocr
