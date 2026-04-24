@@ -1,0 +1,3 @@
+runtime:
+  device: "cpu"
+  sample_mode: true
