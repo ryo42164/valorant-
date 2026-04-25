@@ -1,0 +1,4 @@
+runtime:
+  device: "cuda"
+  sample_mode: false
+  use_gpu: true

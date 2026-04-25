@@ -1,3 +1,4 @@
 runtime:
   device: "cpu"
   sample_mode: true
+  use_gpu: false
