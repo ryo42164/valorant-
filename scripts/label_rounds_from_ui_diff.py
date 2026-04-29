@@ -146,6 +146,39 @@ def preprocess_score_crop(crop, scale=4):
     return th
 
 
+def crop_round_region(frame):
+    h, w = frame.shape[:2]
+    x1 = int(w * 0.51)
+    x2 = int(w * 0.527)
+    y1 = int(h * 0.01)
+    y2 = int(h * 0.025)
+    return frame[y1:y2, x1:x2]
+
+
+def preprocess_round_crop(crop, scale=3):
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    _, th_fixed = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    _, th_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th_adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        11,
+        2,
+    )
+
+    return {
+        "gray": gray,
+        "fixed": th_fixed,
+        "otsu": th_otsu,
+        "adaptive": th_adaptive,
+    }
+
+
 def sanitize_score(x, max_score=25):
     if x is None:
         return None
@@ -161,6 +194,25 @@ def ocr_score_crop(proc_img, reader, max_score=25):
     if not match:
         return None
     return sanitize_score(int(match.group()), max_score=max_score)
+
+
+def read_round_number_from_crop(crop, reader, min_round=1, max_round=45):
+    processed_imgs = preprocess_round_crop(crop)
+
+    for img in processed_imgs.values():
+        results = reader.readtext(img, detail=0, allowlist="0123456789")
+        if not results:
+            continue
+
+        text = "".join(results).strip()
+        if not text.isdigit():
+            continue
+
+        round_no = int(text)
+        if min_round <= round_no <= max_round:
+            return round_no
+
+    return None
 
 
 def majority_vote(values):
@@ -182,6 +234,65 @@ def read_score_at_sec(video_path, t_sec, reader):
     frame = get_frame_at_sec(video_path, t_sec)
     left_score, right_score = read_score_from_frame(frame, reader)
     return {"t_sec": t_sec, "left_score": left_score, "right_score": right_score}
+
+
+def read_round_number_at_sec(video_path, t_sec, reader):
+    frame = get_frame_at_sec(video_path, t_sec)
+    crop = crop_round_region(frame)
+    return read_round_number_from_crop(crop, reader)
+
+
+def read_round_numbers_near_time(video_path, t_sec, reader, offsets):
+    results = []
+
+    for offset in offsets:
+        sample_t_sec = t_sec + offset
+        try:
+            round_no = read_round_number_at_sec(video_path, sample_t_sec, reader)
+        except Exception as exc:
+            round_no = None
+            error = str(exc)
+        else:
+            error = None
+
+        result = {
+            "t_sec": sample_t_sec,
+            "offset": offset,
+            "round_no": round_no,
+        }
+        if error is not None:
+            result["error"] = error
+        results.append(result)
+
+    return results
+
+
+def majority_round_number(samples):
+    return majority_vote([sample["round_no"] for sample in samples])
+
+
+def scan_round_ocr_between(video_path, start_sec, end_sec, reader, step=3):
+    rows = []
+    if pd.isna(start_sec) or pd.isna(end_sec) or end_sec < start_sec:
+        return pd.DataFrame(columns=["t_sec", "round_no_ocr"])
+
+    t_sec = start_sec
+    while t_sec <= end_sec:
+        try:
+            round_no = read_round_number_at_sec(video_path, t_sec, reader)
+        except Exception as exc:
+            round_no = None
+            error = str(exc)
+        else:
+            error = None
+
+        row = {"t_sec": t_sec, "round_no_ocr": round_no}
+        if error is not None:
+            row["error"] = error
+        rows.append(row)
+        t_sec += step
+
+    return pd.DataFrame(rows)
 
 
 def read_score_multi_sec(video_path, t_list, reader):
@@ -296,6 +407,95 @@ def add_left_win_label(df):
     return out.drop(columns=["_next_map", "_next_left", "_next_right", "_map_changed"])
 
 
+def add_round_ocr_samples(
+    video_path,
+    df,
+    reader,
+    start_offsets=(1, 3, 5),
+    end_offsets=(-5, -3, -1),
+):
+    out = df.copy()
+    if "start_sec" not in out.columns:
+        out["start_sec"] = out["t_sec"]
+    if "end_sec" not in out.columns:
+        out["end_sec"] = out["t_sec"]
+
+    out["round_ocr_start_samples"] = out["start_sec"].apply(
+        lambda t: read_round_numbers_near_time(video_path, t, reader, start_offsets)
+    )
+    out["round_ocr_end_samples"] = out["end_sec"].apply(
+        lambda t: read_round_numbers_near_time(video_path, t, reader, end_offsets)
+    )
+    out["round_no_ocr_start"] = out["round_ocr_start_samples"].apply(majority_round_number)
+    out["round_no_ocr_end"] = out["round_ocr_end_samples"].apply(majority_round_number)
+    return out
+
+
+def classify_sequence_status(row):
+    if pd.isna(row["round_no_ocr_start"]):
+        return "ocr_failed"
+    if row["_row_idx"] == 0:
+        return "first"
+    if pd.isna(row["prev_round_no_ocr"]):
+        return "map_change_or_ocr_error"
+    if pd.isna(row["ocr_step"]):
+        return "map_change_or_ocr_error"
+    if row["ocr_step"] == 1:
+        return "ok"
+    if row["ocr_step"] == 0 and row["gap_from_prev"] < 30:
+        return "merge_same_round"
+    if row["ocr_step"] == 0 and row["gap_from_prev"] >= 30:
+        return "drop_previous_candidate"
+    if row["ocr_step"] > 1:
+        return "missing_round_between"
+    if row["ocr_step"] < 0:
+        return "map_change_or_ocr_error"
+    return "map_change_or_ocr_error"
+
+
+def sequence_status_to_action(status):
+    if status in {"ok", "first"}:
+        return "keep"
+    if status == "merge_same_round":
+        return "merge_with_previous"
+    if status == "drop_previous_candidate":
+        return "drop_previous"
+    if status == "missing_round_between":
+        return "inspect_between"
+    if status in {"map_change_or_ocr_error", "ocr_failed"}:
+        return "manual_check"
+    return "manual_check"
+
+
+def add_round_sequence_check(df):
+    out = df.copy()
+    out["_row_idx"] = np.arange(len(out))
+    out["prev_round_no_ocr"] = out["round_no_ocr_start"].shift(1)
+    out["prev_end_like"] = out["end_sec"].shift(1)
+    out["gap_from_prev"] = out["start_sec"] - out["prev_end_like"]
+    out["ocr_step"] = out["round_no_ocr_start"] - out["prev_round_no_ocr"]
+    out["sequence_status"] = out.apply(classify_sequence_status, axis=1)
+    out["action_candidate"] = out["sequence_status"].apply(sequence_status_to_action)
+    return out.drop(columns=["_row_idx"])
+
+
+def add_round_ocr_checks(
+    video_path,
+    df,
+    reader,
+    start_offsets=(1, 3, 5),
+    end_offsets=(-5, -3, -1),
+):
+    out = add_round_ocr_samples(
+        video_path,
+        df,
+        reader,
+        start_offsets=start_offsets,
+        end_offsets=end_offsets,
+    )
+    return add_round_sequence_check(out)
+
+
 def choose_default_video(vods_dir):
     videos = sorted(Path(vods_dir).glob("*.mp4"))
     if not videos:
@@ -313,6 +513,8 @@ def main():
     parser.add_argument("--threshold", type=float, default=30.0)
     parser.add_argument("--min-true-duration-sec", type=float, default=1.0)
     parser.add_argument("--score-offsets", type=float, nargs="+", default=[0.0, 5.0, 10.0])
+    parser.add_argument("--round-start-offsets", type=float, nargs="+", default=[1.0, 3.0, 5.0])
+    parser.add_argument("--round-end-offsets", type=float, nargs="+", default=[-5.0, -3.0, -1.0])
     parser.add_argument("--gpu", action="store_true")
     args = parser.parse_args()
 
@@ -354,13 +556,25 @@ def main():
     scan_path = args.out_dir / f"{stem}_ui_diff.csv"
     segments_path = args.out_dir / f"{stem}_ui_segments.csv"
     labels_path = args.out_dir / f"{stem}_round_labels.csv"
+    checked_labels_path = args.out_dir / f"{stem}_round_labels_checked.csv"
     scan_df.to_csv(scan_path, index=False)
     segments.to_csv(segments_path, index=False)
     labeled.to_csv(labels_path, index=False)
 
+    labels_for_check = pd.read_csv(labels_path)
+    checked = add_round_ocr_checks(
+        video_path,
+        labels_for_check,
+        reader,
+        start_offsets=tuple(args.round_start_offsets),
+        end_offsets=tuple(args.round_end_offsets),
+    )
+    checked.to_csv(checked_labels_path, index=False)
+
     print(f"wrote: {scan_path}")
     print(f"wrote: {segments_path}")
     print(f"wrote: {labels_path}")
+    print(f"wrote: {checked_labels_path}")
     preview_cols = [
         "map_no",
         "round_no",
@@ -371,6 +585,28 @@ def main():
         "left_win_label",
     ]
     print(labeled[preview_cols].head(20))
+    print(checked["sequence_status"].value_counts(dropna=False))
+
+    inspect_actions = {"manual_check", "inspect_between"}
+    inspect_preview_cols = [
+        "map_no",
+        "round_no",
+        "start_sec",
+        "end_sec",
+        "round_no_ocr_start",
+        "round_no_ocr_end",
+        "prev_round_no_ocr",
+        "prev_end_like",
+        "gap_from_prev",
+        "ocr_step",
+        "sequence_status",
+        "action_candidate",
+    ]
+    available_preview_cols = [
+        col for col in inspect_preview_cols if col in checked.columns
+    ]
+    preview = checked[checked["action_candidate"].isin(inspect_actions)]
+    print(preview[available_preview_cols])
 
 
 if __name__ == "__main__":
