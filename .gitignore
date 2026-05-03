@@ -1,5 +1,6 @@
 data/
 !data/processed/
+!data/processed/**
 outputs/
 *.mp4
 *.avi
