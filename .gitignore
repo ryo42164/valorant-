@@ -1,7 +1,6 @@
 data/*
 !data/processed/
 !data/processed/**/
-data/processed/**
 !data/processed/**/*.csv
 outputs/
 *.mp4
