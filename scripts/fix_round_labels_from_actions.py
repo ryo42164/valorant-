@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+MIN_SPLIT_FRAGMENT_SEC = 20.0
+
 try:
     from label_rounds_from_ui_diff import (
         get_frame_at_sec,
@@ -519,11 +521,25 @@ def split_row_on_round_transition(row, video_path, reader, step):
     if boundary_sec is None or boundary_sec <= start_sec or boundary_sec >= end_sec:
         return None, scan_results, []
 
+    first_duration = boundary_sec - start_sec
+    second_duration = end_sec - boundary_sec
+    if (
+        first_duration <= MIN_SPLIT_FRAGMENT_SEC
+        and second_duration <= MIN_SPLIT_FRAGMENT_SEC
+    ):
+        return None, scan_results, []
+
     first = row.copy()
     second = row.copy()
+    split_detail = {
+        "boundary_sec": boundary_sec,
+        "first_duration": first_duration,
+        "second_duration": second_duration,
+        "dropped_fragment": None,
+    }
 
     first["end_sec"] = boundary_sec
-    first["duration_sec"] = boundary_sec - start_sec
+    first["duration_sec"] = first_duration
     first["round_no_ocr_start"] = start_round
     first["round_no_ocr_end"] = start_round
     first["sequence_status"] = "split_round_transition"
@@ -532,7 +548,7 @@ def split_row_on_round_transition(row, video_path, reader, step):
     first["needs_review"] = True
 
     second["start_sec"] = boundary_sec
-    second["duration_sec"] = end_sec - boundary_sec
+    second["duration_sec"] = second_duration
     second["round_no_ocr_start"] = end_round
     second["round_no_ocr_end"] = end_round
     second["prev_round_no_ocr"] = start_round
@@ -542,7 +558,27 @@ def split_row_on_round_transition(row, video_path, reader, step):
     second["fix_applied"] = append_fix(second.get("fix_applied"), "split_round_transition")
     second["needs_review"] = True
 
-    return [first, second], scan_results, [boundary_sec]
+    if (
+        first_duration <= MIN_SPLIT_FRAGMENT_SEC
+        and second_duration > MIN_SPLIT_FRAGMENT_SEC
+    ):
+        second["fix_applied"] = append_fix(
+            second.get("fix_applied"), "split_round_transition_drop_short_first"
+        )
+        split_detail["dropped_fragment"] = "first"
+        return [second], scan_results, split_detail
+
+    if (
+        second_duration <= MIN_SPLIT_FRAGMENT_SEC
+        and first_duration > MIN_SPLIT_FRAGMENT_SEC
+    ):
+        first["fix_applied"] = append_fix(
+            first.get("fix_applied"), "split_round_transition_drop_short_second"
+        )
+        split_detail["dropped_fragment"] = "second"
+        return [first], scan_results, split_detail
+
+    return [first, second], scan_results, split_detail
 
 
 def merge_with_previous(prev_row, cur_row):
@@ -631,7 +667,7 @@ def process_rows(df, video_path, reader, round_search_step, apply_drop):
             continue
 
         if video_path is not None and reader is not None and row_has_round_transition(cur):
-            split_rows, split_scan_results, boundaries = split_row_on_round_transition(
+            split_rows, split_scan_results, split_detail = split_row_on_round_transition(
                 cur, video_path, reader, round_search_step
             )
             if split_rows is not None:
@@ -641,8 +677,9 @@ def process_rows(df, video_path, reader, round_search_step, apply_drop):
                     "split_from_index": cur.get("_input_index"),
                     "from_round": to_int(cur.get("round_no_ocr_start")),
                     "to_round": to_int(cur.get("round_no_ocr_end")),
-                    "boundaries": boundaries,
                 }
+                if isinstance(split_detail, dict):
+                    detail.update(split_detail)
                 log_rows.append(
                     make_log(
                         cur,
@@ -650,7 +687,11 @@ def process_rows(df, video_path, reader, round_search_step, apply_drop):
                         dumps_json(detail),
                         cur=cur,
                         split_from_index=cur.get("_input_index"),
-                        boundary_sec=boundaries[0] if boundaries else np.nan,
+                        boundary_sec=(
+                            split_detail.get("boundary_sec")
+                            if isinstance(split_detail, dict)
+                            else np.nan
+                        ),
                         ocr_scan_results=dumps_json(split_scan_results),
                     )
                 )
@@ -889,11 +930,14 @@ def print_consistency_checks(df):
     left = pd.to_numeric(df.get("left_score"), errors="coerce")
     right = pd.to_numeric(df.get("right_score"), errors="coerce")
     split_score_nan = (split_mask & (left.isna() | right.isna())).sum()
+    duration = pd.to_numeric(df.get("duration_sec"), errors="coerce")
+    short_duration_rows = (duration <= MIN_SPLIT_FRAGMENT_SEC).fillna(False).sum()
 
     print("Consistency checks:")
     print(f"t_sec != start_sec rows: {int(t_mismatch)}")
     print(f"round_no_from_score != round_no rows: {int(round_mismatch)}")
     print(f"split rows with NaN left_score/right_score: {int(split_score_nan)}")
+    print(f"duration_sec <= {MIN_SPLIT_FRAGMENT_SEC:g} rows: {int(short_duration_rows)}")
 
 
 def print_summary(label, df):
