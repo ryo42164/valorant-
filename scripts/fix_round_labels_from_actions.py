@@ -323,6 +323,183 @@ def read_map_for_round(video_path, start_sec, reader):
     return majority_vote(maps), results
 
 
+def normalize_timer_text(timer_text):
+    if is_missing(timer_text):
+        return ""
+
+    text = str(timer_text).strip()
+    text = text.replace("O", "0").replace("o", "0")
+    text = text.replace("I", "1").replace("l", "1")
+    text = text.replace(".", ":").replace(",", ":").replace(";", ":")
+    text = text.replace(" ", "")
+    return text
+
+
+def parse_timer_text_to_sec(timer_text):
+    if is_missing(timer_text):
+        return None
+
+    text = normalize_timer_text(timer_text)
+    match = re.search(r"^(\d{1,2}):(\d{2})$", text)
+    if match:
+        minute = int(match.group(1))
+        second = int(match.group(2))
+        if second < 60:
+            return minute * 60 + second
+        return None
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) == 3:
+        minute = int(digits[0])
+        second = int(digits[1:])
+    elif len(digits) == 4:
+        minute = int(digits[:-2])
+        second = int(digits[-2:])
+    else:
+        return None
+
+    if second >= 60:
+        return None
+    return minute * 60 + second
+
+
+def crop_timer_region(frame):
+    h, w = frame.shape[:2]
+    x1 = int(w * 0.48)
+    x2 = int(w * 0.52)
+    y1 = int(h * 0.025)
+    y2 = int(h * 0.06)
+    return frame[y1:y2, x1:x2]
+
+
+def preprocess_timer_for_ocr(crop):
+    cv2 = require_cv2()
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return th
+
+
+def read_timer_from_frame(frame, reader):
+    if frame is None:
+        return {
+            "timer_text": "",
+            "timer_sec": None,
+            "raw_text": [],
+        }
+    crop = crop_timer_region(frame)
+    proc = preprocess_timer_for_ocr(crop)
+    results = reader.readtext(
+        proc,
+        allowlist="0123456789:.;,",
+        detail=0,
+        paragraph=False
+    )
+    text = "".join(results).strip() if results else ""
+    timer_sec = parse_timer_text_to_sec(text)
+    return {
+        "timer_text": text,
+        "timer_sec": timer_sec,
+        "raw_text": results,
+    }
+
+def read_timer_near_sec(video_path, t_sec, reader, offsets=(-0.4, -0.2, 0.0, 0.2, 0.4)):
+    timer_secs = []
+    timer_texts = []
+
+    for off in offsets:
+        tt = t_sec + off
+        if tt < 0:
+            continue
+
+        frame = get_frame_at_sec(video_path, tt)
+        result = read_timer_from_frame(frame, reader)
+
+        timer_sec = result.get("timer_sec")
+        timer_text = result.get("timer_text")
+
+        timer_texts.append(timer_text)
+
+        if timer_sec is not None and not pd.isna(timer_sec):
+            timer_secs.append(float(timer_sec))
+
+    if len(timer_secs) == 0:
+        return {
+            "timer_sec": None,
+            "timer_texts": timer_texts,
+            "timer_secs": timer_secs,
+        }
+
+    timer_sec = float(np.median(timer_secs))
+
+    return {
+        "timer_sec": timer_sec,
+        "timer_texts": timer_texts,
+        "timer_secs": timer_secs,
+    }
+
+def add_start_timer_offset_columns(df, video_path, reader):
+    out = df.copy()
+
+    start_timer_secs = []
+    offsets = []
+    search_start_secs = []
+    start_timer_raws = []
+
+    if video_path is None or reader is None:
+        out["start_timer_sec"] = np.nan
+        out["start_search_offset_sec"] = np.nan
+        out["search_start_sec"] = np.nan
+        out["start_timer_raws"] = None
+        return out
+
+    for _, row in out.iterrows():
+        start_sec = to_float(row.get("start_sec"))
+
+        if pd.isna(start_sec):
+            start_timer_secs.append(np.nan)
+            offsets.append(np.nan)
+            search_start_secs.append(np.nan)
+            start_timer_raws.append([])
+            continue
+
+        try:
+            timer_result = read_timer_near_sec(video_path, start_sec, reader)
+            timer_sec = timer_result.get("timer_sec")
+            raw_timer_secs = timer_result.get("timer_secs", [])
+        except Exception:
+            timer_sec = None
+            raw_timer_secs = []
+
+        start_timer_raws.append(raw_timer_secs)
+
+        if timer_sec is None or pd.isna(timer_sec):
+            offset = np.nan
+            search_start_sec = np.nan
+            timer_sec_out = np.nan
+
+        elif timer_sec >= 60:
+            offset = 0.0
+            search_start_sec = start_sec
+            timer_sec_out = timer_sec
+
+        else:
+            offset = float(max(timer_sec - 1, 0))
+            search_start_sec = start_sec + offset
+            timer_sec_out = timer_sec
+
+        start_timer_secs.append(timer_sec_out)
+        offsets.append(offset)
+        search_start_secs.append(search_start_sec)
+
+    out["start_timer_sec"] = start_timer_secs
+    out["start_search_offset_sec"] = offsets
+    out["search_start_sec"] = search_start_secs
+    out["start_timer_raws"] = start_timer_raws
+
+    return out
+
+
 def scan_round_numbers_between(video_path, start_sec, end_sec, reader, step):
     scan_results = []
     if pd.isna(start_sec) or pd.isna(end_sec) or end_sec < start_sec:
@@ -950,6 +1127,107 @@ def print_summary(label, df):
         print(df["needs_review"].value_counts(dropna=False).to_string())
 
 
+def recalculate_left_win_label(df):
+    out = df.copy()
+    if "left_win_label" not in out.columns:
+        out["left_win_label"] = pd.NA
+
+    left_win = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    work = out.copy()
+    work["_left_score_num"] = pd.to_numeric(work.get("left_score"), errors="coerce")
+    work["_right_score_num"] = pd.to_numeric(work.get("right_score"), errors="coerce")
+    work["_sort_round_no"] = pd.to_numeric(work.get("round_no"), errors="coerce")
+    work["_sort_start_sec"] = pd.to_numeric(work.get("start_sec"), errors="coerce")
+    work = work.sort_values(
+        ["map_no", "_sort_round_no", "_sort_start_sec"],
+        na_position="last",
+    )
+
+    for _, group in work.groupby("map_no", dropna=False, sort=False):
+        indices = group.index.tolist()
+        for pos, idx in enumerate(indices):
+            cur = group.loc[idx]
+            cur_left = cur["_left_score_num"]
+            cur_right = cur["_right_score_num"]
+            if pd.isna(cur_left) or pd.isna(cur_right):
+                continue
+
+            if pos + 1 < len(indices):
+                nxt = group.loc[indices[pos + 1]]
+                next_left = nxt["_left_score_num"]
+                next_right = nxt["_right_score_num"]
+                if pd.isna(next_left) or pd.isna(next_right):
+                    continue
+                if next_left > cur_left and next_right == cur_right:
+                    left_win.at[idx] = 1
+                elif next_right > cur_right and next_left == cur_left:
+                    left_win.at[idx] = 0
+                continue
+
+            if cur_left != cur_right:
+                left_win.at[idx] = 1 if cur_left > cur_right else 0
+
+    out["left_win_label"] = left_win
+    return out
+
+
+def is_left_attacker(round_no: int) -> bool:
+    if 1 <= round_no <= 12:
+        return False
+    if 13 <= round_no <= 24:
+        return True
+    if round_no >= 25:
+        return (round_no - 25) % 2 == 1
+    raise ValueError(f"invalid round_no: {round_no}")
+
+def make_attacker_win(row):
+    left_win = row["left_win_label"]
+    round_no = row.get("round_no")
+    if pd.isna(left_win) or pd.isna(round_no):
+        return pd.NA
+    left_win = int(left_win)
+    left_attacker = is_left_attacker(int(round_no))
+    if left_attacker:
+        return left_win
+    else:
+        return 1 - left_win
+
+
+def add_attack_defense_win_columns(df):
+    out = df.copy()
+    attacker_win = out.apply(make_attacker_win, axis=1)
+    out["attacker_win"] = pd.Series(attacker_win, index=out.index).astype("Int64")
+    out["defender_win"] = (1 - out["attacker_win"]).astype("Int64")
+    return out
+
+
+def print_win_debug(df):
+    print("left_win_label value counts:")
+    print(df["left_win_label"].value_counts(dropna=False).to_string())
+    print("attacker_win value counts:")
+    print(df["attacker_win"].value_counts(dropna=False).to_string())
+    print(f"left_win_label NaN rows: {int(df['left_win_label'].isna().sum())}")
+    print(f"attacker_win NaN rows: {int(df['attacker_win'].isna().sum())}")
+
+    sort_cols = ["map_no", "round_no", "start_sec"]
+    existing_sort_cols = [col for col in sort_cols if col in df.columns]
+    last_rows = (
+        df.sort_values(existing_sort_cols)
+        .groupby("map_no", dropna=False, sort=False)
+        .tail(1)
+    )
+    debug_cols = [
+        "map_no",
+        "round_no",
+        "left_score",
+        "right_score",
+        "left_win_label",
+        "attacker_win",
+    ]
+    print("Last row by map:")
+    print(last_rows[debug_cols].to_string(index=False))
+
+
 def main():
     args = parse_args()
     input_path = Path(args.input)
@@ -988,10 +1266,14 @@ def main():
 
     fixed_df = pd.DataFrame(fixed_rows)
     fixed_df = recalculate_columns(fixed_df, video_path=video_path, reader=reader)
+    fixed_df = add_start_timer_offset_columns(fixed_df, video_path=video_path, reader=reader)
+    fixed_df = recalculate_left_win_label(fixed_df)
+    fixed_df = add_attack_defense_win_columns(fixed_df)
     log_df = pd.DataFrame(log_rows, columns=LOG_COLUMNS)
 
     print_summary("After", fixed_df)
     print_consistency_checks(fixed_df)
+    print_win_debug(fixed_df)
     print(f"Fix log rows: {len(log_df)}")
 
     if args.dry_run:
