@@ -1,3 +1,5 @@
+requirements_mac.txt
+
 data/*
 !data/processed/
 !data/processed/**/
