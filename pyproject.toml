@@ -1,0 +1,17 @@
+[project]
+name = "valorant"
+version = "0.1.0"
+description = "utilties for video analysis 動画から情報とる関数 "
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python",
+    "numpy",
+    "pandas",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
