@@ -58,10 +58,20 @@ def choose_default_video(vods_dir):
         raise FileNotFoundError(f"No .mp4 files found in {vods_dir}")
     return videos[0]
 
+def add_video_metadata(df, video_id, video_path):
+    out = df.copy()
+    out["video_id"] = video_id
+    out["video_path"] = video_path.as_posix()
+
+    meta_cols = ["video_id", "video_path"]
+    other_cols = [col for col in out.columns if col not in meta_cols]
+    return out[meta_cols + other_cols]
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=Path, default=None)
+    parser.add_argument("--video-id", type=str, default=None)
+    parser.add_argument("--template-image", type=Path, default=None)
     parser.add_argument("--vods-dir", type=Path, default=Path("data/vods"))
     parser.add_argument("--out-dir", type=Path, default=Path("data/processed/round_labels"))
     parser.add_argument("--template-sec", type=float, default=3000.0)
@@ -75,12 +85,22 @@ def main():
     args = parser.parse_args()
 
     video_path = args.video or choose_default_video(args.vods_dir)
+    video_id = args.video_id if args.video_id is not None else video_path.stem
     _, _, duration_sec = get_video_info(video_path)
     template_sec = min(max(args.template_sec, 0.0), max(0.0, duration_sec - 1.0))
-    template = crop_ui_region(get_frame_at_sec(video_path, template_sec))
 
+    if args.template_image is not None:
+        import cv2
+
+        template = cv2.imread(str(args.template_image))
+        if template is None:
+            raise FileNotFoundError(f"template image not found: {args.template_image}")
+
+        print(f"template_image: {args.template_image}")
+    else:
+        template = crop_ui_region(get_frame_at_sec(video_path, template_sec))
+        print(f"template_sec: {template_sec:.2f}")
     print(f"video: {video_path}")
-    print(f"template_sec: {template_sec:.2f}")
     print("scan_ui_diff...")
     scan_df = scan_ui_diff(
         video_path,
@@ -113,6 +133,9 @@ def main():
     segments_path = args.out_dir / f"{stem}_ui_segments.csv"
     labels_path = args.out_dir / f"{stem}_round_labels.csv"
     checked_labels_path = args.out_dir / f"{stem}_round_labels_checked.csv"
+    scan_df = add_video_metadata(scan_df, video_id, video_path)
+    segments = add_video_metadata(segments, video_id, video_path)
+    labeled = add_video_metadata(labeled, video_id, video_path)
     scan_df.to_csv(scan_path, index=False)
     segments.to_csv(segments_path, index=False)
     labeled.to_csv(labels_path, index=False)
@@ -125,6 +148,7 @@ def main():
         start_offsets=tuple(args.round_start_offsets),
         end_offsets=tuple(args.round_end_offsets),
     )
+    checked = add_video_metadata(checked, video_id, video_path)
     checked.to_csv(checked_labels_path, index=False)
 
     print(f"wrote: {scan_path}")
