@@ -42,3 +42,13 @@ def crop_round_region(frame):
     y1 = int(h * 0.01)
     y2 = int(h * 0.025)
     return frame[y1:y2, x1:x2]
+
+def crop_map_region(frame):
+    x1,x2 = 50,445
+    y1,y2 = 50,445
+    return frame[y1:y2,x1:x2]
+
+def crop_map_from_video(video):
+    x1,x2 = 50,445
+    y1,y2 = 50,445
+    return video[:,y1:y2,x1:x2,:]
